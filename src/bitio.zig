@@ -127,3 +127,9 @@ pub fn byteReadEnum(reader: anytype, endian: std.builtin.Endian, comptime Enum: 
     const tag_int: TagInt = try byteReadInt(reader, endian, TagInt);
     return std.meta.intToEnum(Enum, tag_int) catch error.Corrupt;
 }
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2015-2020 Zig Contributors
+// This file is part of [zig](https://ziglang.org/), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
