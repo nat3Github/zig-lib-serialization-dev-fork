@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const src_dir = "src";
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
     const install_step = b.getInstallStep();
 
@@ -19,35 +21,26 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     const src = b.path(src_dir);
-    const root = src.path(b, "main.zig");
+    const root = src.path(b, "serialize.zig");
 
-    const exported_module = b.addModule("serialization", .{
-        .root_source_file = root,
-    });
-    _ = exported_module;
-
-    // target and optimization just for the tests/docs
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    const tests = b.addTest(.{
-        .name = "Serialization",
+    const module = b.addModule("serialization", .{
         .root_source_file = root,
         .target = target,
         .optimize = optimize,
-        .use_llvm = b.option(bool, "use-llvm", "Whether to use the llvm backend"),
-        .use_lld = b.option(bool, "use-lld", "Whether to use the lld linker"),
+    });
+
+    const tests = b.addTest(.{
+        .name = "Serialization-Tests",
+        .root_module = module,
     });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
 
-    const doc_compile = b.addObject(.{
+    const doc_compile = b.addTest(.{
         .name = "Serialization",
-        .root_source_file = root,
-        .target = target,
-        .optimize = optimize,
+        .root_module = module,
     });
-    doc_compile.step.dependOn(&fmt.step);
+    doc_compile.step.dependOn(fmt_step);
 
     const docs = doc_compile.getEmittedDocs();
     const doc_install = b.addInstallDirectory(.{
@@ -55,5 +48,6 @@ pub fn build(b: *std.Build) void {
         .source_dir = docs,
         .install_subdir = "",
     });
+
     doc_step.dependOn(&doc_install.step);
 }

@@ -12,11 +12,15 @@
 
 const std = @import("std");
 const bitio = @import("bitio.zig");
-const io = std.io;
+const builtin = @import("builtin");
 const mem = std.mem;
 const math = std.math;
-const meta = std.meta;
 const testing = std.testing;
+
+const Allocator = std.mem.Allocator;
+const Endian = std.builtin.Endian;
+
+const native_endian = builtin.cpu.arch.endian();
 
 /// Generally used instead of `usize` when serializing data in order to ensure identical behavior cross-platform
 pub const Size = u32;
@@ -30,6 +34,55 @@ const custom_serialize_fn_name = "serialize";
 const custom_deserialize_fn_name = "deserialize";
 const custom_allocating_deserialize_fn_name = "allocatingDeserialize";
 const custom_mode_decl_name = "serialization_mode";
+
+/// Identical to the `@hasDecl` builtin, but if `T` is not a namespace,
+/// then instead of causing a compile error, return false.
+inline fn safeHasDecl(comptime T: type, comptime name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct",
+        .@"union",
+        .@"enum",
+        .@"opaque",
+        => @hasDecl(T, name),
+        else => false,
+    };
+}
+
+/// The enum tag of union `T`, except always exhaustive and with noreturn fields removed.
+/// Very useful for deserialization of tagged unions.
+fn UnionTag(comptime T: type) type {
+    const BaseTag = @typeInfo(T).@"union".tag_type.?;
+    const old_fields = @typeInfo(T).@"union".fields;
+    const enum_info = @typeInfo(BaseTag).@"enum";
+    var fields_buf: [enum_info.fields.len]std.builtin.Type.EnumField = undefined;
+    var i: usize = 0;
+    for (old_fields, enum_info.fields) |union_field, enum_field| {
+        if (union_field.type != noreturn) {
+            fields_buf[i] = enum_field;
+            i += 1;
+        }
+    }
+    const fields = fields_buf[0..i];
+    return @Type(.{ .@"enum" = .{
+        .decls = &.{},
+        .fields = fields,
+        .is_exhaustive = true,
+        .tag_type = enum_info.tag_type,
+    } });
+}
+
+/// Whether `Pointer` contains bytes which can be directly read to/written from.
+/// Sounds simple, but has several niche edge cases.
+fn pointerHasIoBytes(comptime Pointer: type) bool {
+    const type_info = @typeInfo(Pointer);
+    const ptr_info = type_info.pointer;
+    if (Pointer != @Type(type_info)) {
+        // Handles pointers to packed struct fields,
+        // which painfully cannot be differentiated with typeInfo
+        return false;
+    }
+    return ptr_info.address_space == .generic and !ptr_info.is_allowzero and !ptr_info.is_volatile;
+}
 
 /// These are pre made modes to add to your custom types to quickly define how to serialize data without boilerplate.
 /// To use, just add a "serialization_mde"
@@ -54,28 +107,26 @@ pub const SerializationMode = enum {
     unserializable,
 
     /// Get the serialization mode of a type
-    inline fn get(comptime T: type) SerializationMode {
-        switch (@typeInfo(T)) {
-            .@"struct", .@"union", .@"enum" => {
-                if (@hasDecl(T, custom_mode_decl_name)) {
-                    return switch (@TypeOf(@field(T, custom_mode_decl_name))) {
-                        SerializationMode,
-                        @TypeOf(.EnumLiteral),
-                        => @field(T, custom_mode_decl_name),
-                        else => .none,
-                    };
-                } else {
-                    return .none;
-                }
-            },
-            else => return .none,
+    fn get(comptime T: type) SerializationMode {
+        if (safeHasDecl(T, custom_mode_decl_name)) {
+            const override = @field(T, custom_mode_decl_name);
+            switch (@TypeOf(override)) {
+                SerializationMode => return override,
+                @Type(.enum_literal) => {
+                    const tag = @tagName(override);
+                    if (@hasField(SerializationMode, tag)) {
+                        return @field(SerializationMode, tag);
+                    }
+                },
+                else => {},
+            }
         }
+        return .none;
     }
 };
 
 test SerializationMode {
     const IEEE = packed union {
-        // use the .packed_union serialization mode
         const serialization_mode = .packed_union;
 
         fields: packed struct {
@@ -88,8 +139,6 @@ test SerializationMode {
 
         fn expectEqual(self: @This(), other: @This()) !void {
             try std.testing.expectEqual(self.int, other.int);
-            if (!std.math.isNan(self.float))
-                try std.testing.expectEqual(self.float, other.float);
         }
     };
 
@@ -117,10 +166,17 @@ test SerializationMode {
     }
 }
 
+fn hasSerializationFns(comptime T: type) bool {
+    const serialize_fn = safeHasDecl(T, custom_serialize_fn_name);
+    const deserialize_fn = safeHasDecl(T, custom_deserialize_fn_name);
+    const alloc_deserialize_fn = safeHasDecl(T, custom_allocating_deserialize_fn_name);
+    return serialize_fn and (deserialize_fn or alloc_deserialize_fn);
+}
+
 /// Whether a type uses custom serialization functions
-inline fn usesCustomSerialize(comptime T: type) bool {
+fn usesCustomSerialize(comptime T: type) bool {
     return switch (SerializationMode.get(T)) {
-        .none => (meta.hasFn(T, custom_allocating_deserialize_fn_name) or meta.hasFn(T, custom_deserialize_fn_name)) and meta.hasFn(T, custom_serialize_fn_name),
+        .none => hasSerializationFns(T),
         .noop => true,
         .ignore_custom, .packed_union => false,
         .unserializable => false,
@@ -128,19 +184,16 @@ inline fn usesCustomSerialize(comptime T: type) bool {
 }
 
 /// Whether custom serialization functions are used anywhere in the structure of a type
-inline fn containsCustomSerialize(comptime T: type) bool {
+fn containsCustomSerialize(comptime T: type) bool {
     return comptime usesCustomSerialize(T) or switch (@typeInfo(T)) {
-        .@"struct" => |Struct| blk: {
-            for (Struct.fields) |field| {
-                if (containsCustomSerialize(field.type)) break :blk true;
-            }
-            break :blk false;
-        },
-        .@"union" => |Union| blk: {
-            if (Union.tag_type) |Tag| {
+        .@"struct" => |s| for (s.fields) |field| {
+            if (!field.is_comptime and containsCustomSerialize(field.type)) break true;
+        } else false,
+        .@"union" => |u| blk: {
+            if (u.tag_type) |Tag| {
                 if (containsCustomSerialize(Tag)) break :blk true;
             }
-            for (Union.fields) |field| {
+            for (u.fields) |field| {
                 if (containsCustomSerialize(field.type)) break :blk true;
             }
             break :blk false;
@@ -152,7 +205,7 @@ inline fn containsCustomSerialize(comptime T: type) bool {
 /// Whether a type uses serialization compatible with being @bitCasted from a packed struct field
 inline fn usesNonIntSerialize(comptime T: type) bool {
     return switch (SerializationMode.get(T)) {
-        .none => (meta.hasFn(T, custom_allocating_deserialize_fn_name) or meta.hasFn(T, custom_deserialize_fn_name)) and meta.hasFn(T, custom_serialize_fn_name),
+        .none => hasSerializationFns(T),
         .noop => true,
         .ignore_custom, .packed_union => false,
         .unserializable => false,
@@ -162,17 +215,14 @@ inline fn usesNonIntSerialize(comptime T: type) bool {
 /// Whether a type can be
 inline fn containsNonIntSerialize(comptime T: type) bool {
     return comptime usesCustomSerialize(T) or switch (@typeInfo(T)) {
-        .@"struct" => |Struct| blk: {
-            for (Struct.fields) |field| {
-                if (containsCustomSerialize(field.type)) break :blk true;
-            }
-            break :blk false;
-        },
-        .@"union" => |Union| blk: {
-            if (Union.tag_type) |Tag| {
+        .@"struct" => |s| for (s.fields) |field| {
+            if (!field.is_comptime and containsCustomSerialize(field.type)) break true;
+        } else false,
+        .@"union" => |u| blk: {
+            if (u.tag_type) |Tag| {
                 if (containsCustomSerialize(Tag)) break :blk true;
             }
-            for (Union.fields) |field| {
+            for (u.fields) |field| {
                 if (containsCustomSerialize(field.type)) break :blk true;
             }
             break :blk false;
@@ -181,129 +231,177 @@ inline fn containsNonIntSerialize(comptime T: type) bool {
     };
 }
 
-// code for cleaner error messages
-// reduces guess work by saying exactly which field of a struct/union cannot be serialized
-// TODO: clean up this code a lot
-
-const SerializationErrorInfo = struct {
+/// Code for cleaner error messages
+/// Reduces guess work by saying exactly which field of a struct/union cannot be serialized
+/// TODO: clean up this code a lot
+const SerializeError = struct {
     problem: type,
-    fields: []const []const u8,
-    info: ?[]const u8 = null,
-};
+    trace: Trace,
+    info: []const u8,
 
-/// Actual implementation of generating error messages for unserializable types
-inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comptime prev: []const []const u8) ?SerializationErrorInfo {
-    switch (SerializationMode.get(T)) {
-        .unserializable => return .{
-            .problem = T,
-            .fields = prev ++ &[1][]const u8{name},
-            .info = "Custom type specifies that it is unserializable",
-        },
-        .packed_union => switch (@typeInfo(T)) {
-            .@"union" => |info| {
-                if (info.layout != .@"packed") {
-                    return .{
-                        .problem = T,
-                        .fields = prev ++ &[1][]const u8{name},
-                        .info = "Serialization mode `.packed_union` used on an unpacked union",
-                    };
-                } else {
-                    return null;
-                }
-            },
-            else => return .{
+    const Trace = struct {
+        names: []const []const u8,
+
+        const empty: Trace = .{ .names = &.{} };
+
+        fn push(comptime trace: Trace, comptime name: []const u8) Trace {
+            return .{ .names = trace.names ++ .{name} };
+        }
+    };
+
+    /// Actual implementation of generating error messages for unserializable types
+    fn initInner(comptime T: type, comptime name: []const u8, comptime trace: Trace) ?SerializeError {
+        const new_trace = trace.push(name);
+        switch (SerializationMode.get(T)) {
+            .unserializable => return .{
                 .problem = T,
-                .fields = prev ++ &[1][]const u8{name},
-                .info = "Serialization mode `.packed_union` used on non packed-union",
+                .trace = trace.push(name),
+                .info = "Custom type specifies that it is unserializable",
             },
-        },
-        .none, .ignore_custom, .noop => {},
-    }
-
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| {
-            if (usesCustomSerialize(T)) return null;
-            inline for (info.fields) |field| {
-                if (serializeErrorFields(field.type, field.name, prev ++ &[1][]const u8{name})) |err| {
-                    return err;
-                }
-            }
-            return null;
-        },
-
-        .@"union" => |info| {
-            if (usesCustomSerialize(T)) return null;
-            if (info.tag_type) |_| {
-                if (info.fields.len == 0) return .{
+            .packed_union => switch (@typeInfo(T)) {
+                .@"union" => |info| {
+                    if (info.layout != .@"packed") {
+                        return .{
+                            .problem = T,
+                            .trace = new_trace,
+                            .info = "Serialization mode `.packed_union` used on an unpacked union",
+                        };
+                    } else {
+                        return null;
+                    }
+                },
+                else => return .{
                     .problem = T,
-                    .fields = prev ++ &[1][]const u8{name},
-                    .info = "Zero field unions cannot be serialized",
-                };
+                    .trace = new_trace,
+                    .info = "Serialization mode `.packed_union` used on non packed-union",
+                },
+            },
+            .none, .ignore_custom, .noop => {},
+        }
 
+        switch (@typeInfo(T)) {
+            .@"struct" => |info| {
+                if (usesCustomSerialize(T)) return null;
                 inline for (info.fields) |field| {
-                    if (serializeErrorFields(field.type, field.name, prev ++ &[1][]const u8{name})) |err| {
+                    if (field.is_comptime) continue;
+                    if (initInner(field.type, field.name, new_trace)) |err| {
                         return err;
                     }
                 }
+                return null;
+            },
+
+            .@"union" => |info| {
+                if (usesCustomSerialize(T)) return null;
+                if (info.tag_type != null) {
+                    if (info.fields.len == 0) return .{
+                        .problem = T,
+                        .trace = new_trace,
+                        .info = "Zero field unions cannot be serialized",
+                    };
+
+                    var all_noreturn = true;
+                    inline for (info.fields) |field| {
+                        switch (field.type) {
+                            noreturn => continue,
+                            else => {
+                                if (initInner(field.type, field.name, new_trace)) |err| {
+                                    return err;
+                                } else {
+                                    all_noreturn = false;
+                                }
+                            },
+                        }
+                    }
+
+                    if (all_noreturn) return .{
+                        .problem = T,
+                        .trace = new_trace,
+                        .info = "Unions with all noreturn fields cannot be serialized",
+                    };
+
+                    return null;
+                } else if (info.layout == .@"packed") return .{
+                    .problem = T,
+                    .trace = new_trace,
+                    .info = "Packed unions cannot be serialized without serialization mode `.packed_union` or custom serialization/deserialization methods",
+                } else return .{
+                    .problem = T,
+                    .trace = new_trace,
+                    .info = "Untagged unions cannot be serialized without custom serialize/deserialize methods",
+                };
+            },
+            .@"enum" => |info| {
+                if (usesCustomSerialize(T)) return null;
+
+                if (@typeInfo(info.tag_type) != .int) return .{
+                    .problem = T,
+                    .trace = new_trace,
+                    .info = "Can only serialize enums if they are tagged with runtime ints",
+                };
+
+                if (info.is_exhaustive and info.fields.len == 0) return .{
+                    .problem = T,
+                    .trace = new_trace,
+                    .info = "Zero field enums cannot be serialized",
+                };
 
                 return null;
-            } else if (info.layout == .@"packed") return .{
-                .problem = T,
-                .fields = prev ++ &[1][]const u8{name},
-                .info = "Packed unions cannot be serialized without serialization mode `.packed_union` or custom serialization/deserialization methods",
-            } else return .{
-                .problem = T,
-                .fields = prev ++ &[1][]const u8{name},
-                .info = "Untagged unions cannot be serialized without custom serialize/deserialize methods",
-            };
-        },
-        .@"enum" => |info| {
-            if (usesCustomSerialize(T)) return null;
+            },
 
-            if (info.is_exhaustive and info.fields.len == 0) return .{
-                .problem = T,
-                .fields = prev ++ &[1][]const u8{name},
-                .info = "Zero field enums cannot be serialized",
-            };
+            .optional => |info| return initInner(info.child, "?", new_trace),
 
-            return null;
-        },
+            inline .array, .vector => |info| return switch (info.len) {
+                0 => null,
+                else => initInner(info.child, name ++ "[...]", trace),
+            },
 
-        .optional => |info| return serializeErrorFields(info.child, "?", prev ++ &[1][]const u8{name}),
-        inline .array, .vector => |info| return if (info.len == 0) null else serializeErrorFields(info.child, name ++ "[...]", prev),
+            .int, .float, .bool, .void, .undefined, .null => return null,
 
-        .int, .float, .bool, .void, .undefined, .null => return null,
-
-        else => return .{ .problem = T, .fields = prev ++ &[1][]const u8{name}, .info = switch (@typeInfo(T)) {
-            .pointer => "Pointers cannot be serialized. Consider using custom serialize/deserialize methods",
-            .ErrorUnion => "Error unions cannot be serialized, did you mean to use a 'try' statement?",
-            .ErrorSet => "Error sets cannot be serialized",
-            .Fn => "Functions cannot be serialized",
-            .Type => "Types cannot be serialized",
-            .Frame, .AnyFrame => "Frames cannot be serialized",
-            .EnumLiteral => "Enum literals cannot be serialized",
-            else => null,
-        } },
+            else => return .{ .problem = T, .trace = new_trace, .info = switch (@typeInfo(T)) {
+                .pointer => "Pointers cannot be serialized. Consider using custom serialize/deserialize methods",
+                .error_union => "Error unions cannot be serialized, did you mean to use a 'try' statement?",
+                .error_set => "Error sets cannot be serialized",
+                .@"fn" => "Functions cannot be serialized",
+                .type => "Types cannot be serialized",
+                .frame, .@"anyframe" => "Frames cannot be serialized",
+                .enum_literal => "Enum literals cannot be serialized",
+                else => "Unimplemented and/or Unplanned",
+            } },
+        }
     }
-}
 
-/// The error message for trying to serialize/deserialize a type, if that type is not serializable/deserializable
-pub inline fn serializeTypeErrorMessage(comptime T: type) ?[]const u8 {
-    const opfields = serializeErrorFields(T, @typeName(T), &.{});
-    if (opfields) |errfields| {
+    inline fn init(comptime T: type) ?SerializeError {
+        return comptime .initInner(T, @typeName(T), .empty);
+    }
+
+    fn toMessage(comptime serialize_error: SerializeError) [:0]const u8 {
         const nav = comptime blk: {
-            var field_nav_str: []const u8 = "";
-            for (errfields.fields) |errmsg| {
+            var field_nav_str: []const u8 = &.{};
+            for (serialize_error.trace.names) |errmsg| {
                 field_nav_str = field_nav_str ++ "." ++ errmsg;
             }
             break :blk field_nav_str[1..];
         };
 
-        return std.fmt.comptimePrint(
-            \\Error with serialization of type {}
-            \\Cannot meaningfully serialize {s} type of {s}
-            \\{s}
-        , .{ errfields.problem, @tagName(@typeInfo(errfields.problem)), nav, errfields.info orelse "Unimplemented and/or Unplanned" });
+        return "Error with serialization of type" ++ @typeName(serialize_error.problem) ++ "\n" ++
+            "Cannot meaningfully serialize " ++ @tagName(@typeInfo(serialize_error.problem)) ++
+            " type of " ++ nav ++ "\n" ++
+            serialize_error.info;
+    }
+
+    fn maybeRaise(comptime T: type) void {
+        if (SerializeError.init(T)) |serialize_error| {
+            @compileError(serialize_error.toMessage());
+        }
+    }
+};
+
+/// If `T` cannot be serialized/deserialized,
+/// returns an error message explaining why.
+pub inline fn serializeTypeError(comptime T: type) ?[]const u8 {
+    if (SerializeError.init(T)) |serialization_error| {
+        return serialization_error;
     } else {
         return null;
     }
@@ -311,84 +409,119 @@ pub inline fn serializeTypeErrorMessage(comptime T: type) ?[]const u8 {
 
 /// Whether type `T` is able to be serialized/deserialized
 pub inline fn canSerialize(comptime T: type) bool {
-    return serializeTypeErrorMessage(T) == null;
+    return SerializeError.init(T) == null;
 }
 
 /// Whether an allocator is required for deserializtion of type `T`
 pub inline fn deserializeNeedsAllocator(comptime T: type) bool {
-    return if (!canSerialize(T)) false else switch (@typeInfo(T)) {
-        .@"struct" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (deserializeNeedsAllocator(field.type)) break :blk true;
-            }
-            break :blk false;
-        },
+    return comptime canSerialize(T) and switch (@typeInfo(T)) {
+        .@"struct" => |info| for (info.fields) |field| {
+            if (!field.is_comptime and deserializeNeedsAllocator(field.type)) true;
+        } else false,
         .@"union" => |info| blk: {
             if (info.tag_type) |Tag| {
                 if (deserializeNeedsAllocator(Tag)) break :blk true;
             }
-            inline for (info.fields) |field| {
+            for (info.fields) |field| {
                 if (deserializeNeedsAllocator(field.type)) break :blk true;
             }
             break :blk false;
         },
-        else => usesCustomSerialize(T) and meta.hasFn(T, custom_allocating_deserialize_fn_name),
+        else => usesCustomSerialize(T) and !safeHasDecl(T, custom_deserialize_fn_name),
     };
 }
 
-inline fn integerLayout(comptime T: type) bool {
-    return switch (@typeInfo(T)) {
-        .int, .float => true,
-        .vector => |info| integerLayout(info.child),
-        .@"struct" => |info| info.layout == .@"packed",
-        .@"union" => |info| info.layout == .@"packed",
-        else => false,
-    };
-}
-
-inline fn byteLayout(comptime T: type, comptime endian: std.builtin.Endian, comptime packing: Packing) bool {
-    const native_endian = @import("builtin").cpu.arch.endian();
-    const is_native = endian == native_endian;
-    const is_integral = integerLayout(T);
-    const matches_packing = switch (packing) {
-        .bit => @typeInfo(T) == .vector and @divFloor(@bitSizeOf(T), 8) == @sizeOf(T),
-        .byte => @divFloor(@bitSizeOf(T), 8) == @sizeOf(T),
-    };
-    if (is_native and matches_packing and is_integral) return true;
-    return switch (@typeInfo(T)) {
-        .array => |info| blk: {
-            const child_integral = integerLayout(info.child);
-            const child_byte = byteLayout(info.child, endian, packing);
-            if (@bitSizeOf(info.child) == 8 and (child_byte or child_integral)) break :blk true;
-            const child_byte_aligned = @mod(@bitSizeOf(info.child), 8) == 0;
-            break :blk child_byte_aligned and (is_native != child_integral);
+fn uniqueEnum(comptime E: type) bool {
+    switch (@typeInfo(E)) {
+        .@"enum" => |e| switch (@typeInfo(e.tag_type)) {
+            .int => |i| {
+                if (e.is_exhaustive) {
+                    const expected_fields = 1 << @as(comptime_int, i.bits);
+                    return e.fields.len == expected_fields;
+                } else {
+                    return true;
+                }
+            },
+            else => {},
         },
+        else => {},
+    }
+    return false;
+}
+
+fn intSerializable(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool => true,
+        inline .@"struct", .@"union" => |s| s.layout == .@"packed",
         else => false,
     };
 }
 
-/// Whether it is correct to serialize/deserialize type `T` by `@bitCast`ing to/from integers
-inline fn intSerializable(comptime T: type) bool {
-    return comptime integerLayout(T) and !containsNonIntSerialize(T);
-}
-
-/// Whether it is correct to serialize/deserialize type `T` by `@bitCast`ing to/from bytes
-inline fn byteSerializable(comptime T: type, comptime endian: std.builtin.Endian, comptime packing: Packing) bool {
-    return comptime byteLayout(T, endian, packing) and !containsNonIntSerialize(T);
+/// Whether the bytes of `T` in memory are already ordered in the same way they would be serialized.
+/// May return false negatives, but never false positives.
+/// Used to sometimes simplify the process of serializing/deserializing values.
+/// mode `fallible` is for writing, and assumes the bytes form a valid `T`.
+/// mode `unique` is for reading, and only returns true if all values of
+fn orderedBytes(comptime T: type, comptime endian: Endian, comptime mode: enum { unique, fallible }) bool {
+    switch (@typeInfo(T)) {
+        .@"enum" => |e| return orderedBytes(e.tag_type, endian, mode) and switch (mode) {
+            .unique => uniqueEnum(T),
+            .fallible => true,
+        },
+        .@"struct" => |s| {
+            if (s.backing_integer) |Int| {
+                return orderedBytes(Int, endian, mode);
+            } else switch (s.layout) {
+                .@"packed" => {
+                    const Int = @Type(.{
+                        .int = .{
+                            .bits = @bitSizeOf(T),
+                            .signedness = .unsigned,
+                        },
+                    });
+                    return orderedBytes(Int, endian, mode);
+                },
+                .auto, .@"extern" => {
+                    // This often works for extern structs,
+                    // and it is possible that auto struct layout happens to work here
+                    comptime var offset = 0;
+                    return inline for (s.fields) |field| {
+                        if (!field.is_comptime) {
+                            if (comptime offset == @offsetOf(T, field.name) and orderedBytes(field.type, endian, mode)) {
+                                offset += @sizeOf(field.type);
+                            } else {
+                                break false;
+                            }
+                        }
+                    } else offset == @sizeOf(T);
+                },
+            }
+        },
+        .array => |a| return a.len == 0 or orderedBytes(a.child, endian, mode),
+        else => return intSerializable(T) and switch (@bitSizeOf(T)) {
+            0, 8 => true,
+            else => |bits| @sizeOf(T) * 8 == bits and endian == native_endian,
+        },
+    }
 }
 
 /// Reads values from a reader
-pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mode: Packing, comptime ReaderType: type) type {
+pub fn Deserializer(comptime endianness: Endian, comptime packing_mode: Packing, comptime ReaderType: type) type {
     return struct {
-        pub const endian: std.builtin.Endian = endianness;
+        pub const endian: Endian = endianness;
         pub const packing: Packing = packing_mode;
 
-        pub const UnderlyingReader = ReaderType;
-        pub const ActiveReader = if (packing == .bit) io.BitReader(endian, UnderlyingReader) else UnderlyingReader;
-        pub const ReadError = ActiveReader.Error;
+        pub const UnderlyingReader: type = ReaderType;
+        pub const ActiveReader: type = switch (packing) {
+            .bit => std.io.BitReader(endian, UnderlyingReader),
+            .byte => UnderlyingReader,
+        };
+
+        pub const ReadError = error{} || ActiveReader.Error; // empty error set merge so tooling knows its an error set
+        pub const ReadEofError = error{EndOfStream} || ReadError;
 
         /// Signifies that the type is a valid deserializer
-        pub const ValidDeserializer = Deserializer;
+        const ValidDeserializer = Deserializer;
 
         reader: ActiveReader,
 
@@ -397,7 +530,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         pub fn init(reader: UnderlyingReader) Self {
             return Self{
                 .reader = switch (packing) {
-                    .bit => io.bitReader(endian, reader),
+                    .bit => std.io.bitReader(endian, reader),
                     .byte => reader,
                 },
             };
@@ -410,9 +543,6 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
 
         /// T should have a well defined memory layout and bit width
         fn deserializeInt(self: *Self, comptime Int: type) !Int {
-            if (!integerLayout(Int))
-                @compileError("Cannot use deserializeInt on type " ++ @typeName(Int) ++ ", whose layout is not portable");
-
             return switch (packing) {
                 .bit => bitio.bitReadInt(&self.reader, Int),
                 .byte => bitio.byteReadInt(&self.reader, endian, Int),
@@ -420,9 +550,6 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         }
 
         fn deserializeEnum(self: *Self, comptime Enum: type) !Enum {
-            if (@typeInfo(Enum) != .@"enum")
-                @compileError("Cannot use deserializeEnum on type " ++ @typeName(Enum) ++ ", which is not an enum");
-
             return switch (packing) {
                 .bit => bitio.bitReadEnum(&self.reader, Enum),
                 .byte => bitio.byteReadEnum(&self.reader, endian, Enum),
@@ -433,7 +560,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
 
         inline fn fasterDeserializeType(comptime T: type) DeserializeType {
             if (usesNonIntSerialize(T)) return .value;
-            if (byteSerializable(T, endian, packing)) return .pointer;
+            if (packing_mode == .byte and orderedBytes(T, endian, .unique)) return .pointer;
             return switch (@typeInfo(T)) {
                 .null, .void, .undefined => .value,
                 .bool => .value,
@@ -441,6 +568,14 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 .optional => .value,
                 else => if (@sizeOf(T) <= @sizeOf(usize)) .value else .pointer,
             };
+        }
+
+        fn mayDirectlyReadTo(comptime Pointer: type) bool {
+            const info = @typeInfo(Pointer).pointer;
+            if (pointerHasIoBytes(Pointer)) {
+                return packing_mode == .byte and orderedBytes(info.child, endian, .unique);
+            }
+            return false;
         }
 
         /// Deserializes and returns data of the specified type from the stream
@@ -451,24 +586,22 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         /// the memory (eg, using value.deinit() on data structures).
         ///
         /// The 'ptr' argument is generic so that it can take in pointers to packed struct fields, etc
-        pub fn allocatingDeserialize(self: *Self, comptime T: type, allocator: mem.Allocator) !T {
-            if (serializeTypeErrorMessage(T)) |err| {
-                @compileError(err);
-            }
-            if (usesCustomSerialize(T)) {
-                //custom deserializer: fn(deserializer: anytype) !T
-                if (meta.hasFn(T, custom_deserialize_fn_name)) {
+        pub fn allocatingDeserialize(self: *Self, comptime T: type, allocator: Allocator) !T {
+            SerializeError.maybeRaise(T);
+
+            if (comptime usesCustomSerialize(T)) {
+                if (@hasDecl(T, custom_deserialize_fn_name)) {
+                    //custom deserializer: fn(deserializer: anytype) !T
                     return @field(T, custom_deserialize_fn_name)(self);
-                }
-                //custom allocating deserializer: fn(deserializer: anytype, allocator: std.mem.Allocator) !T
-                else if (meta.hasFn(T, custom_allocating_deserialize_fn_name)) {
+                } else if (@hasDecl(T, custom_allocating_deserialize_fn_name)) {
+                    //custom allocating deserializer: fn(deserializer: anytype, allocator: Allocator) !T
                     return @field(T, custom_allocating_deserialize_fn_name)(self, allocator);
                 } else {
                     comptime unreachable;
                 }
             }
 
-            switch (SerializationMode.get(T)) {
+            switch (comptime SerializationMode.get(T)) {
                 .none, .ignore_custom => {},
                 .unserializable => comptime unreachable,
                 .packed_union => return @bitCast(try self.deserializeInt(@Type(.{
@@ -480,41 +613,33 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 .noop => return @as(T, undefined),
             }
 
-            if (byteSerializable(T, endian, packing)) raw_read: {
-                const reader = switch (packing) {
-                    .bit => blk: {
-                        if (self.reader.count != 0) break :raw_read;
-                        break :blk self.reader.reader;
-                    },
-                    .byte => self.reader,
-                };
-                const result = blk: {
-                    var buf: T = undefined;
-                    try reader.readNoEof(std.mem.asBytes(&buf));
-                    break :blk buf;
-                };
-                return result;
+            if (comptime mayDirectlyReadTo(*T)) {
+                var out: T = undefined;
+                try self.allocatingDeserializeInto(&out, allocator);
+                return out;
             }
 
-            if (intSerializable(T)) {
+            if (comptime intSerializable(T)) {
                 const U = @Type(.{ .int = .{
                     .signedness = .unsigned,
                     .bits = @bitSizeOf(T),
                 } });
                 return @bitCast(try self.deserializeInt(U));
-            } else return switch (@typeInfo(T)) {
-                .undefined => @as(@TypeOf(undefined), undefined),
-                .void => void{},
+            }
+
+            return switch (@typeInfo(T)) {
+                .undefined => undefined,
+                .void => {},
                 .null => null,
 
                 .float, .int => comptime unreachable, // already handled with deserializeInt
+
                 .bool => (try self.deserializeInt(u1)) != 0,
 
                 .@"enum" => self.deserializeEnum(T),
 
                 .optional => |info| blk: {
-                    const whether: bool = try self.deserializeInt(u1) == 1;
-                    if (whether) {
+                    if (try self.deserializeInt(bool)) {
                         break :blk try self.allocatingDeserialize(info.child, allocator);
                     } else {
                         break :blk null;
@@ -527,7 +652,8 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                     if (@typeInfo(Tag).@"enum".is_exhaustive) {
                         switch (tag) {
                             inline else => |field| {
-                                const Payload: type = @TypeOf(@field(@as(T, undefined), @tagName(field)));
+                                const Payload: type = @FieldType(T, @tagName(field));
+                                if (Payload == noreturn) return error.Corrupt;
                                 switch (fasterDeserializeType(Payload)) {
                                     .pointer => {
                                         var with_tag = @unionInit(T, @tagName(field), undefined);
@@ -550,7 +676,8 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                     } else {
                         inline for (info.fields) |field| {
                             const field_tag = @field(Tag, field.name);
-                            const Payload = @TypeOf(@field(@as(T, undefined), field.name));
+                            const Payload = field.type;
+                            if (Payload == noreturn) continue;
                             if (field_tag == tag) {
                                 switch (fasterDeserializeType(Payload)) {
                                     .pointer => {
@@ -593,7 +720,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         /// the memory (eg, using value.deinit() on data structures)
         ///
         /// The 'ptr' argument is generic so that it can take in pointers to packed struct fields, etc
-        pub fn allocatingDeserializeInto(self: *Self, ptr: anytype, allocator: mem.Allocator) !void {
+        pub fn allocatingDeserializeInto(self: *Self, ptr: anytype, allocator: Allocator) !void {
             const Ptr = @TypeOf(ptr);
             const ptr_info = @typeInfo(@TypeOf(ptr));
 
@@ -613,16 +740,16 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 },
             };
 
-            if (serializeTypeErrorMessage(T)) |err| {
-                @compileError(err);
-            } else if (usesCustomSerialize(T)) {
+            SerializeError.maybeRaise(T);
+
+            if (comptime usesCustomSerialize(T)) {
                 //custom deserializer: fn(deserializer: anytype) !void
-                if (meta.hasFn(T, custom_deserialize_fn_name)) {
+                if (@hasDecl(T, custom_deserialize_fn_name)) {
                     ptr.* = try self.deserialize(T);
                     return;
                 }
-                //custom allocating deserializer: fn(self: *Self, deserializer: anytype, allocator: std.mem.Allocator) !void
-                else if (meta.hasFn(T, custom_allocating_deserialize_fn_name)) {
+                //custom allocating deserializer: fn(self: *Self, deserializer: anytype, allocator: Allocator) !void
+                else if (@hasDecl(T, custom_allocating_deserialize_fn_name)) {
                     ptr.* = try self.allocatingDeserialize(T, allocator);
                     return;
                 } else {
@@ -630,80 +757,46 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 }
             }
 
-            switch (SerializationMode.get(T)) {
+            switch (comptime SerializationMode.get(T)) {
                 .none, .ignore_custom => {},
                 .unserializable => comptime unreachable,
                 .packed_union => {
-                    ptr.* = @bitCast(try self.deserializeInt(@Type(.{
-                        .int = .{
-                            .signedness = .unsigned,
-                            .bits = @bitSizeOf(T),
-                        },
-                    })));
+                    ptr.* = @bitCast(try self.deserializeInt(@Type(.{ .int = .{
+                        .signedness = .unsigned,
+                        .bits = @bitSizeOf(T),
+                    } })));
                     return;
                 },
                 .noop => return,
             }
 
-            if (byteSerializable(T, endian, packing)) raw_read: {
-                const reader = switch (packing) {
-                    .bit => blk: {
-                        if (self.reader.count != 0) break :raw_read;
-                        break :blk self.reader.reader;
-                    },
-                    .byte => self.reader,
-                };
-                return reader.readNoEof(std.mem.asBytes(ptr));
-            }
-
-            if (intSerializable(T)) {
+            if (comptime mayDirectlyReadTo(Ptr)) {
+                return self.reader.readNoEof(std.mem.asBytes(ptr));
+            } else if (comptime intSerializable(T)) {
                 ptr.* = try self.deserialize(T);
                 return;
             }
 
             switch (@typeInfo(T)) {
-                .float, .int => ptr.* = try self.deserializeInt(T), // handled with the intSerializable check
+                .float, .int => ptr.* = try self.deserializeInt(T), // handled with the intSerializable check, redundant
                 .void, .undefined, .null, .@"enum", .bool, .optional => ptr.* = try self.deserialize(T),
                 .@"struct" => |info| inline for (info.fields) |field_info| {
-                    switch (fasterDeserializeType(@TypeOf(@field(ptr, field_info.name)))) {
+                    if (!field_info.is_comptime) switch (fasterDeserializeType(field_info.type)) {
                         .pointer => try self.allocatingDeserializeInto(&@field(ptr, field_info.name), allocator),
-                        .value => @field(ptr, field_info.name) = try self.allocatingDeserialize(@TypeOf(@field(ptr, field_info.name)), allocator),
-                    }
+                        .value => @field(ptr, field_info.name) = try self.allocatingDeserialize(field_info.type, allocator),
+                    };
                 },
-                .@"union" => |info| {
-                    const Tag: type = info.tag_type.?;
-                    const tag: Tag = try self.deserialize(Tag);
-                    if (@typeInfo(Tag).@"enum".is_exhaustive) {
-                        switch (tag) {
-                            inline else => |field| {
-                                switch (fasterDeserializeType(@TypeOf(@field(ptr, @tagName(field))))) {
-                                    .pointer => {
-                                        ptr.* = @unionInit(T, @tagName(field), undefined);
-                                        self.allocatingDeserializeInto(&@field(ptr, @tagName(field)), allocator);
-                                    },
-                                    .value => {
-                                        ptr.* = @unionInit(T, @tagName(tag), try self.allocatingDeserialize(@TypeOf(@field(ptr, @tagName(field))), allocator));
-                                    },
-                                }
+                .@"union" => {
+                    switch (try self.deserialize(UnionTag(T))) {
+                        inline else => |field| switch (fasterDeserializeType(@FieldType(T, @tagName(field)))) {
+                            .pointer => {
+                                ptr.* = @unionInit(T, @tagName(field), undefined);
+                                try self.allocatingDeserializeInto(&@field(ptr, @tagName(field)), allocator);
                             },
-                        }
-                    } else {
-                        inline for (info.fields) |field| field_iter: {
-                            const field_tag = @field(Tag, field.name);
-                            if (field_tag == tag) {
-                                switch (fasterDeserializeType(@TypeOf(@field(ptr, field.name)))) {
-                                    .pointer => {
-                                        ptr.* = @unionInit(T, field.name, undefined);
-                                        self.allocatingDeserializeInto(&@field(ptr, field.name), allocator);
-                                    },
-                                    .value => {
-                                        ptr.* = @unionInit(T, @tagName(tag), try self.allocatingDeserialize(@TypeOf(@field(ptr, field.name)), allocator));
-                                    },
-                                }
-                                break :field_iter;
-                            }
-                        }
-                        return error.Corrupt;
+                            .value => {
+                                ptr.* = @unionInit(T, @tagName(field), try self.allocatingDeserialize(@FieldType(T, @tagName(field)), allocator));
+                            },
+                        },
                     }
                 },
                 .array => {
@@ -713,7 +806,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 },
                 .vector => |info| {
                     for (0..info.len) |i| {
-                        if (fasterDeserializeType(info.child) == .pointer and @typeInfo(@TypeOf(&ptr[i])).Pointer.alignment >= @alignOf(info.child)) {
+                        if (fasterDeserializeType(info.child) == .pointer and @typeInfo(@TypeOf(&ptr[i])).pointer.alignment >= @alignOf(info.child)) {
                             try self.allocatingDeserializeInto(&ptr[i], allocator);
                         } else {
                             ptr[i] = try self.allocatingDeserialize(info.child, allocator);
@@ -744,7 +837,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         pub fn deserializeInto(self: *Self, ptr: anytype) !void {
             const T: type = @TypeOf(ptr);
 
-            const C: type = @typeInfo(T).Pointer.child;
+            const C: type = @typeInfo(T).pointer.child;
 
             return if (comptime deserializeNeedsAllocator(C))
                 @compileError("Deserialization of type " ++ @typeName(C) ++ " requires an allocator")
@@ -756,36 +849,38 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
 
 /// Create a `Derializer` from a `reader`, `packing`, and `endian`
 pub fn deserializer(
-    comptime endian: std.builtin.Endian,
+    comptime endian: Endian,
     comptime packing: Packing,
     reader: anytype,
 ) Deserializer(endian, packing, @TypeOf(reader)) {
-    return Deserializer(endian, packing, @TypeOf(reader)).init(reader);
+    return .init(reader);
 }
 
 /// Writes values to a writer
-pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode: Packing, comptime WriterType: type) type {
+pub fn Serializer(comptime endianness: Endian, comptime packing_mode: Packing, comptime WriterType: type) type {
     return struct {
-        pub const endian: std.builtin.Endian = endianness;
+        pub const endian: Endian = endianness;
         pub const packing: Packing = packing_mode;
 
-        pub const UnderlyingWriter = WriterType;
-        pub const ActiveWriter = if (packing == .bit) io.BitWriter(endian, UnderlyingWriter) else UnderlyingWriter;
-        pub const WriteError = ActiveWriter.Error;
+        pub const UnderlyingWriter: type = WriterType;
+        pub const ActiveWriter: type = switch (packing) {
+            .bit => std.io.BitWriter(endian, UnderlyingWriter),
+            .byte => UnderlyingWriter,
+        };
 
         /// Signifies that the type is a valid serializer
-        pub const ValidSerializer = Serializer;
+        const ValidSerializer = Serializer;
 
         writer: ActiveWriter,
 
         const Self = @This();
 
-        pub const Error = error{} || UnderlyingWriter.Error;
+        pub const Error = error{} || UnderlyingWriter.Error; // empty error set merge so tooling knows its an error set
 
         pub fn init(writer: UnderlyingWriter) Self {
             return Self{
                 .writer = switch (packing) {
-                    .bit => io.bitWriter(endian, writer),
+                    .bit => std.io.bitWriter(endian, writer),
                     .byte => writer,
                 },
             };
@@ -797,9 +892,6 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
         }
 
         fn serializeInt(self: *Self, comptime Int: type, value: Int) !void {
-            if (!integerLayout(Int))
-                @compileError("Cannot use serializeInt on type " ++ @typeName(Int) ++ ", whose layout is not portable");
-
             return switch (packing) {
                 .bit => bitio.bitWriteInt(&self.writer, Int, value),
                 .byte => bitio.byteWriteInt(&self.writer, endian, Int, value),
@@ -807,9 +899,6 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
         }
 
         fn serializeEnum(self: *Self, comptime Enum: type, tag: Enum) !void {
-            if (@typeInfo(Enum) != .@"enum")
-                @compileError("Cannot use serializeEnum on type " ++ @typeName(Enum) ++ ", which is not an enum");
-
             return switch (packing) {
                 .bit => bitio.bitWriteEnum(&self.writer, Enum, tag),
                 .byte => bitio.byteWriteEnum(&self.writer, endian, Enum, tag),
@@ -818,12 +907,13 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
 
         /// Serializes the passed value into the writer
         pub fn serialize(self: *Self, comptime T: type, value: T) !void {
-            if (serializeTypeErrorMessage(T)) |err| {
-                @compileError(err);
-            } else if (usesCustomSerialize(T)) {
+            SerializeError.maybeRaise(T);
+
+            if (comptime usesCustomSerialize(T)) {
                 return @field(T, custom_serialize_fn_name)(value, self);
             }
-            switch (SerializationMode.get(T)) {
+
+            switch (comptime SerializationMode.get(T)) {
                 .none, .ignore_custom => {},
                 .unserializable => comptime unreachable,
                 .packed_union => return self.serializeInt(@Type(.{
@@ -834,33 +924,31 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
                 }), @bitCast(value)),
                 .noop => return,
             }
-            if (byteSerializable(T, endian, packing)) raw_write: {
-                const writer = switch (packing) {
-                    .bit => blk: {
-                        if (self.writer.count != 0) break :raw_write;
-                        break :blk self.writer.writer;
-                    },
-                    .byte => self.writer,
+
+            if (comptime packing_mode == .byte and orderedBytes(T, endian, .fallible)) {
+                // When possible, attempt to greatly simplify the serialization process
+                // by just printing the value as it is im memory
+                return switch (@sizeOf(T)) {
+                    0 => {},
+                    else => self.writer.writeAll(std.mem.asBytes(&value)),
                 };
-                return writer.writeAll(std.mem.asBytes(&value));
             }
-            if (intSerializable(T)) {
+
+            if (comptime intSerializable(T)) {
                 const U = @Type(.{ .int = .{
                     .signedness = .unsigned,
                     .bits = @bitSizeOf(T),
                 } });
                 return self.serializeInt(U, @bitCast(value));
             } else switch (@typeInfo(T)) {
-                .void, .undefined, .null => return void{},
+                .void, .undefined, .null => return {},
                 .bool => try self.serializeInt(u1, @intFromBool(value)),
                 .float, .int => comptime unreachable, // handled by intSerializable
                 .@"struct" => |info| {
-                    if (intSerializable(T)) {
-                        try self.serializeInt(T, value);
-                    } else inline for (info.fields) |field_info| {
-                        const name: []const u8 = field_info.name;
-                        const FieldType: type = field_info.type;
-                        try self.serialize(FieldType, @field(value, name));
+                    inline for (info.fields) |field| {
+                        if (!field.is_comptime) {
+                            try self.serialize(field.type, @field(value, field.name));
+                        }
                     }
                 },
                 .@"union" => |info| union_blk: {
@@ -896,12 +984,12 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
                     }
                 },
                 .vector => |info| {
-                    for (0..info.len) |i| {
-                        try self.serialize(info.child, value[i]);
-                    }
+                    return self.serialize([info.len]info.child, value);
                 },
                 else => {
-                    @compileError("Cannot serialize " ++ @tagName(@typeInfo(T)) ++ " types.\nError in obtaining proper error message for serialization of this invalid type. Sorry :(");
+                    @compileError("Cannot serialize " ++ @tagName(@typeInfo(T)) ++ " types.\n" ++
+                        \\Error in obtaining proper error message for serialization of this invalid type. Sorry :(
+                    );
                 },
             }
         }
@@ -910,27 +998,27 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
 
 /// Whether type `T` is a serializer interface
 pub inline fn isSerializer(comptime T: type) bool {
-    if (@typeInfo(T) == .Pointer) {
-        if (@typeInfo(T).Pointer.size != .One) {
+    if (@typeInfo(T) == .pointer) {
+        if (@typeInfo(T).pointer.size != .one) {
             return false;
         } else {
-            return isSerializer(@typeInfo(T).Pointer.child);
+            return isSerializer(@typeInfo(T).pointer.child);
         }
     } else {
-        return @hasDecl(T, "ValidSerializer") and T.ValidSerializer == Serializer;
+        return safeHasDecl(T, "ValidSerializer") and T.ValidSerializer == Serializer;
     }
 }
 
 /// Whether type `T` is a deserializer interface
 pub inline fn isDeserializer(comptime T: type) bool {
-    if (@typeInfo(T) == .Pointer) {
-        if (@typeInfo(T).Pointer.size != .One) {
+    if (@typeInfo(T) == .pointer) {
+        if (@typeInfo(T).pointer.size != .one) {
             return false;
         } else {
-            return isDeserializer(@typeInfo(T).Pointer.child);
+            return isDeserializer(@typeInfo(T).pointer.child);
         }
     } else {
-        return @hasDecl(T, "ValidDeserializer") and T.ValidDeserializer == Deserializer;
+        return safeHasDecl(T, "ValidDeserializer") and T.ValidDeserializer == Deserializer;
     }
 }
 
@@ -957,26 +1045,26 @@ pub inline fn assertDeserializer(deserializer_value: anytype) void {
 
 /// Create a `Serializer` from a `writer`, `packing`, and `endian`
 pub fn serializer(
-    comptime endian: std.builtin.Endian,
+    comptime endian: Endian,
     comptime packing: Packing,
     writer: anytype,
 ) Serializer(endian, packing, @TypeOf(writer)) {
-    return Serializer(endian, packing, @TypeOf(writer)).init(writer);
+    return .init(writer);
 }
 
 /// Test whether a value can be serialized and deserialized back into the original value, with options for endian and packing.
 /// `expectEqlFn` should be a function type of signature `fn (a: T, b: T) !void` which returns an error if `a != b`.
 /// In general, it is advised to just pass in `std.testing.expectEqual` here.
 fn testSerializableDeserializableExtra(
-    comptime endian: std.builtin.Endian,
+    comptime endian: Endian,
     comptime packing: Packing,
     comptime T: type,
     x: T,
-    allocator: mem.Allocator,
+    allocator: Allocator,
     expectEqlFn: anytype,
 ) !void {
     // we use this as a buffer to write our serialized data to
-    var serialized_data = std.ArrayList(u8).init(testing.allocator);
+    var serialized_data: std.ArrayList(u8) = .init(testing.allocator);
     defer serialized_data.deinit();
 
     const writer = serialized_data.writer();
@@ -994,12 +1082,12 @@ fn testSerializableDeserializableExtra(
     // since we dont know the type, we dont know hoe to properly deallocate any memory we may have allocated
     // in fact, we dont even know if we allocate memory at all.
     // so we use an arena which should cover any memory leaks
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
     const arena_alloc = arena.allocator();
 
-    var stream = io.StreamSource{ .buffer = io.fixedBufferStream(serialized_data.items) };
+    var stream: std.io.StreamSource = .{ .buffer = std.io.fixedBufferStream(serialized_data.items) };
     const reader = stream.reader();
 
     var _deserializer = deserializer(endian, packing, reader);
@@ -1016,7 +1104,7 @@ fn testSerializableDeserializableExtra(
 /// Test whether a value can be serialized and deserialized back into the original value.
 /// `expectEqlFn` should be a function type of signature `fn (a: T, b: T) !void` which returns an error if `a != b`.
 /// In general, it is advised to just pass in `std.testing.expectEqual` here.
-fn testSerializable(comptime T: type, x: T, allocator: mem.Allocator, testEqualFn: anytype) !void {
+fn testSerializable(comptime T: type, x: T, allocator: Allocator, testEqualFn: anytype) !void {
     try testSerializableDeserializableExtra(.little, .bit, T, x, allocator, testEqualFn);
     try testSerializableDeserializableExtra(.little, .byte, T, x, allocator, testEqualFn);
     try testSerializableDeserializableExtra(.big, .bit, T, x, allocator, testEqualFn);
@@ -1024,7 +1112,7 @@ fn testSerializable(comptime T: type, x: T, allocator: mem.Allocator, testEqualF
 }
 
 /// Test basic functionality of serializing integers
-fn testIntSerializerDeserializer(comptime endian: std.builtin.Endian, comptime packing: Packing) !void {
+fn testIntSerializerDeserializer(comptime endian: Endian, comptime packing: Packing) !void {
     const max_test_bitsize: comptime_int = 128;
     @setEvalBranchQuota(max_test_bitsize * 10);
 
@@ -1038,10 +1126,10 @@ fn testIntSerializerDeserializer(comptime endian: std.builtin.Endian, comptime p
     };
 
     var data_mem: [total_bytes]u8 = undefined;
-    var out = io.fixedBufferStream(&data_mem);
+    var out = std.io.fixedBufferStream(&data_mem);
     var _serializer = serializer(endian, packing, out.writer());
 
-    var in = io.fixedBufferStream(&data_mem);
+    var in = std.io.fixedBufferStream(&data_mem);
     var _deserializer = deserializer(endian, packing, in.reader());
 
     comptime var i: comptime_int = 0;
@@ -1089,7 +1177,7 @@ fn testIntSerializerDeserializer(comptime endian: std.builtin.Endian, comptime p
 
     //Verify that empty error set works with serializer.
     //deserializer is covered by FixedBufferStream
-    var null_serializer = serializer(endian, packing, io.null_writer);
+    var null_serializer = serializer(endian, packing, std.io.null_writer);
     try null_serializer.serialize(@TypeOf(data_mem), data_mem);
     try null_serializer.flush();
 }
@@ -1103,10 +1191,10 @@ test "Serializer/Deserializer Int" {
 
 /// Test basic functionality of serializing floats
 fn testIntSerializerDeserializerInfNaN(
-    comptime endian: std.builtin.Endian,
+    comptime endian: Endian,
     comptime packing: Packing,
 ) !void {
-    var data = std.ArrayList(u8).init(testing.allocator);
+    var data: std.ArrayList(u8) = .init(testing.allocator);
     defer data.deinit();
 
     var _serializer = serializer(endian, packing, data.writer());
@@ -1124,7 +1212,7 @@ fn testIntSerializerDeserializerInfNaN(
 
     try _serializer.flush();
 
-    var buffer = io.fixedBufferStream(data.items);
+    var buffer = std.io.fixedBufferStream(data.items);
 
     var _deserializer = deserializer(endian, packing, buffer.reader());
 
@@ -1198,25 +1286,23 @@ test "Serializer/Deserializer generic" {
     };
 
     const PackedByte = packed struct(u8) {
-        f_lo: u4,
-        f_hi: u4,
+        lo: u4,
+        hi: u4,
     };
 
     //to test custom serialization
     const Custom = struct {
-        const Self = @This();
+        float: f16,
+        unused_u32: u32,
 
-        f_f16: f16,
-        f_unused_u32: u32,
-
-        fn deserialize(_deserializer: anytype) !Self {
+        fn deserialize(_deserializer: anytype) !@This() {
             assertDeserializer(_deserializer);
-            return Self{ .f_f16 = try _deserializer.deserialize(f16), .f_unused_u32 = 47 };
+            return .{ .float = try _deserializer.deserialize(f16), .unused_u32 = 47 };
         }
 
-        fn serialize(self: Self, _serializer: anytype) !void {
+        fn serialize(self: @This(), _serializer: anytype) !void {
             assertSerializer(_serializer);
-            try _serializer.serialize(@TypeOf(self.f_f16), self.f_f16);
+            try _serializer.serialize(@TypeOf(self.float), self.float);
         }
     };
 
@@ -1244,35 +1330,35 @@ test "Serializer/Deserializer generic" {
         f_color: Color,
     };
 
-    const my_inst = MyStruct{
+    const my_inst: MyStruct = .{
         .f_i3 = -1,
         .f_u8 = 8,
-        .f_non_exhaustive_union = NonExhaustiveUnion{ .B = 148 },
+        .f_non_exhaustive_union = .{ .B = 148 },
         .f_u24 = 24,
         .f_i19 = 19,
-        .f_void = void{},
+        .f_void = {},
         .f_f32 = 32.32,
         .f_f128 = 128.128,
-        .f_packed_0 = PackedStruct{ .f_i3 = -1, .f_u2 = 2 },
-        .f_i7arr = [10]i7{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
-        .f_u16vec = @Vector(4, u16){ 10, 11, 12, 13 },
-        .f_bytearr = @bitCast([16]u8{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p' }),
+        .f_packed_0 = .{ .f_i3 = -1, .f_u2 = 2 },
+        .f_i7arr = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        .f_u16vec = .{ 10, 11, 12, 13 },
+        .f_bytearr = @bitCast([_]u8{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p' }),
         .f_of64n = null,
         .f_of64v = 64.64,
         .f_opt_color_null = null,
-        .f_opt_color_value = ColorType.R32,
-        .f_packed_1 = PackedStruct{ .f_i3 = 1, .f_u2 = 1 },
-        .f_custom = Custom{ .f_f16 = 38.63, .f_unused_u32 = 47 },
+        .f_opt_color_value = .R32,
+        .f_packed_1 = .{ .f_i3 = 1, .f_u2 = 1 },
+        .f_custom = .{ .float = 38.63, .unused_u32 = 47 },
         .f_opt_custom_null = null,
-        .f_opt_custom_value = Custom{ .f_f16 = 12.34, .f_unused_u32 = 47 },
-        .f_color = Color{ .R32 = 123822 },
+        .f_opt_custom_value = .{ .float = 12.34, .unused_u32 = 47 },
+        .f_color = .{ .R32 = 123822 },
     };
 
     try testSerializable(MyStruct, my_inst, testing.allocator, testing.expectEqualDeep);
 }
 
 /// Expect failure for serializing invalid enums
-fn testBadData(comptime endian: std.builtin.Endian, comptime packing: Packing) !void {
+fn testBadData(comptime endian: Endian, comptime packing: Packing) !void {
     const E = enum(u14) {
         One = 1,
         Two = 2,
@@ -1288,10 +1374,10 @@ fn testBadData(comptime endian: std.builtin.Endian, comptime packing: Packing) !
     };
 
     var data_mem: [4]u8 = undefined;
-    var out = io.fixedBufferStream(&data_mem);
+    var out = std.io.fixedBufferStream(&data_mem);
     var _serializer = serializer(endian, packing, out.writer());
 
-    var in = io.fixedBufferStream(&data_mem);
+    var in = std.io.fixedBufferStream(&data_mem);
     var _deserializer = deserializer(endian, packing, in.reader());
 
     try _serializer.serialize(u14, 3);
@@ -1310,11 +1396,6 @@ test "Deserializer bad data" {
     try testBadData(.big, .bit);
     try testBadData(.big, .byte);
 }
-
-test {
-    testing.refAllDeclsRecursive(@This());
-}
-
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2015-2020 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
