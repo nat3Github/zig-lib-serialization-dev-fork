@@ -1,23 +1,24 @@
 /// Provides symmetrical interfaces for both regular writers and bit writers
 const std = @import("std");
 const builtin = @import("builtin");
+const Type = std.builtin.Type;
 
 /// Whether type `T` is 0-bit at both comptime and runtime (void, u0, [0]T, etc.)
 pub inline fn noData(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .Null, .Undefined, .Void => true,
-        .ComptimeInt,
-        .ComptimeFloat,
-        .Fn,
-        .EnumLiteral,
-        .Frame,
-        .AnyFrame,
-        .Opaque,
+        .null, .undefined, .void => true,
+        .comptime_int,
+        .comptime_float,
+        .@"fn",
+        .enum_literal,
+        .frame,
+        .@"anyframe",
+        .@"opaque",
         => false,
-        .Int, .Float => @bitSizeOf(T) == 0,
-        .Enum => |e| noData(e.tag_type) or (e.fields.len <= 1 and e.is_exhaustive),
-        .Array => |a| a.len == 0 or noData(a.child),
-        .Vector => |a| a.len == 0 or noData(a.child),
+        .int, .float => @bitSizeOf(T) == 0,
+        .@"enum" => |e| noData(e.tag_type) or (e.fields.len <= 1 and e.is_exhaustive),
+        .array => |a| a.len == 0 or noData(a.child),
+        .vector => |a| a.len == 0 or noData(a.child),
         else => @bitSizeOf(T) == 0,
     };
 }
@@ -29,7 +30,7 @@ pub inline fn noData(comptime T: type) bool {
 pub fn bitWriteInt(bit_writer: anytype, comptime Int: type, int: Int) !void {
     if (noData(Int)) return;
 
-    const U: type = @Type(.{ .Int = .{
+    const U: type = @Type(.{ .int = .{
         .signedness = .unsigned,
         .bits = @bitSizeOf(Int),
     } });
@@ -44,7 +45,7 @@ pub fn bitWriteInt(bit_writer: anytype, comptime Int: type, int: Int) !void {
 pub fn bitReadInt(bit_reader: anytype, comptime Int: type) !Int {
     if (noData(Int)) return @as(Int, undefined);
 
-    const U: type = @Type(.{ .Int = .{
+    const U: type = @Type(.{ .int = .{
         .signedness = .unsigned,
         .bits = @bitSizeOf(Int),
     } });
@@ -55,7 +56,7 @@ pub fn bitReadInt(bit_reader: anytype, comptime Int: type) !Int {
 /// Writing counterpart to `bitReadEnum`
 /// Bit counterpart to `byteWriteEnum`
 pub fn bitWriteEnum(bit_writer: anytype, comptime Enum: type, tag: Enum) !void {
-    const TagInt: type = @typeInfo(Enum).Enum.tag_type;
+    const TagInt: type = @typeInfo(Enum).@"enum".tag_type;
     return bitWriteInt(bit_writer, TagInt, @intFromEnum(tag));
 }
 
@@ -65,7 +66,7 @@ pub fn bitWriteEnum(bit_writer: anytype, comptime Enum: type, tag: Enum) !void {
 /// Reading counterpart to `bitWriteEnum`
 /// Bit counterpart to `byteReadEnum`
 pub fn bitReadEnum(bit_reader: anytype, comptime Enum: type) !Enum {
-    const TagInt: type = @typeInfo(Enum).Enum.tag_type;
+    const TagInt: type = @typeInfo(Enum).@"enum".tag_type;
     const tag_int: TagInt = try bitReadInt(bit_reader, TagInt);
     return std.meta.intToEnum(Enum, tag_int) catch error.Corrupt;
 }
@@ -77,7 +78,7 @@ pub fn bitReadEnum(bit_reader: anytype, comptime Enum: type) !Enum {
 pub fn byteWriteInt(writer: anytype, endian: std.builtin.Endian, comptime Int: type, int: Int) !void {
     if (noData(Int)) return;
 
-    const U: type = @Type(.{ .Int = .{
+    const U: type = @Type(.{ .int = .{
         .signedness = .unsigned,
         .bits = @bitSizeOf(Int),
     } });
@@ -93,7 +94,7 @@ pub fn byteWriteInt(writer: anytype, endian: std.builtin.Endian, comptime Int: t
 pub fn byteReadInt(reader: anytype, endian: std.builtin.Endian, comptime Int: type) !Int {
     if (noData(Int)) return @as(Int, undefined);
 
-    const U: type = @Type(.{ .Int = .{
+    const U: type = @Type(.{ .int = .{
         .signedness = .unsigned,
         .bits = @bitSizeOf(Int),
     } });
@@ -112,7 +113,7 @@ pub fn byteReadInt(reader: anytype, endian: std.builtin.Endian, comptime Int: ty
 /// Writing counterpart to `byteReadEnum`
 /// Byte counterpart to `bitWriteEnum`
 pub fn byteWriteEnum(writer: anytype, endian: std.builtin.Endian, comptime Enum: type, tag: Enum) !void {
-    const TagInt: type = @typeInfo(Enum).Enum.tag_type;
+    const TagInt: type = @typeInfo(Enum).@"enum".tag_type;
     return byteWriteInt(writer, endian, TagInt, @intFromEnum(tag));
 }
 
@@ -122,7 +123,7 @@ pub fn byteWriteEnum(writer: anytype, endian: std.builtin.Endian, comptime Enum:
 /// Reading counterpart to `byteWriteEnum`
 /// Byte counterpart to `bitReadEnum`
 pub fn byteReadEnum(reader: anytype, endian: std.builtin.Endian, comptime Enum: type) !Enum {
-    const TagInt: type = @typeInfo(Enum).Enum.tag_type;
+    const TagInt: type = @typeInfo(Enum).@"enum".tag_type;
     const tag_int: TagInt = try byteReadInt(reader, endian, TagInt);
     return std.meta.intToEnum(Enum, tag_int) catch error.Corrupt;
 }

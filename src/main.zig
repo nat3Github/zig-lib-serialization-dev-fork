@@ -56,7 +56,7 @@ pub const SerializationMode = enum {
     /// Get the serialization mode of a type
     inline fn get(comptime T: type) SerializationMode {
         switch (@typeInfo(T)) {
-            .Struct, .Union, .Enum => {
+            .@"struct", .@"union", .@"enum" => {
                 if (@hasDecl(T, custom_mode_decl_name)) {
                     return switch (@TypeOf(@field(T, custom_mode_decl_name))) {
                         SerializationMode,
@@ -130,13 +130,13 @@ inline fn usesCustomSerialize(comptime T: type) bool {
 /// Whether custom serialization functions are used anywhere in the structure of a type
 inline fn containsCustomSerialize(comptime T: type) bool {
     return comptime usesCustomSerialize(T) or switch (@typeInfo(T)) {
-        .Struct => |Struct| blk: {
+        .@"struct" => |Struct| blk: {
             for (Struct.fields) |field| {
                 if (containsCustomSerialize(field.type)) break :blk true;
             }
             break :blk false;
         },
-        .Union => |Union| blk: {
+        .@"union" => |Union| blk: {
             if (Union.tag_type) |Tag| {
                 if (containsCustomSerialize(Tag)) break :blk true;
             }
@@ -162,13 +162,13 @@ inline fn usesNonIntSerialize(comptime T: type) bool {
 /// Whether a type can be
 inline fn containsNonIntSerialize(comptime T: type) bool {
     return comptime usesCustomSerialize(T) or switch (@typeInfo(T)) {
-        .Struct => |Struct| blk: {
+        .@"struct" => |Struct| blk: {
             for (Struct.fields) |field| {
                 if (containsCustomSerialize(field.type)) break :blk true;
             }
             break :blk false;
         },
-        .Union => |Union| blk: {
+        .@"union" => |Union| blk: {
             if (Union.tag_type) |Tag| {
                 if (containsCustomSerialize(Tag)) break :blk true;
             }
@@ -200,7 +200,7 @@ inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comp
             .info = "Custom type specifies that it is unserializable",
         },
         .packed_union => switch (@typeInfo(T)) {
-            .Union => |info| {
+            .@"union" => |info| {
                 if (info.layout != .@"packed") {
                     return .{
                         .problem = T,
@@ -221,7 +221,7 @@ inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comp
     }
 
     switch (@typeInfo(T)) {
-        .Struct => |info| {
+        .@"struct" => |info| {
             if (usesCustomSerialize(T)) return null;
             inline for (info.fields) |field| {
                 if (serializeErrorFields(field.type, field.name, prev ++ &[1][]const u8{name})) |err| {
@@ -231,7 +231,7 @@ inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comp
             return null;
         },
 
-        .Union => |info| {
+        .@"union" => |info| {
             if (usesCustomSerialize(T)) return null;
             if (info.tag_type) |_| {
                 if (info.fields.len == 0) return .{
@@ -257,7 +257,7 @@ inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comp
                 .info = "Untagged unions cannot be serialized without custom serialize/deserialize methods",
             };
         },
-        .Enum => |info| {
+        .@"enum" => |info| {
             if (usesCustomSerialize(T)) return null;
 
             if (info.is_exhaustive and info.fields.len == 0) return .{
@@ -269,13 +269,13 @@ inline fn serializeErrorFields(comptime T: type, comptime name: []const u8, comp
             return null;
         },
 
-        .Optional => |info| return serializeErrorFields(info.child, "?", prev ++ &[1][]const u8{name}),
-        inline .Array, .Vector => |info| return if (info.len == 0) null else serializeErrorFields(info.child, name ++ "[...]", prev),
+        .optional => |info| return serializeErrorFields(info.child, "?", prev ++ &[1][]const u8{name}),
+        inline .array, .vector => |info| return if (info.len == 0) null else serializeErrorFields(info.child, name ++ "[...]", prev),
 
-        .Int, .Float, .Bool, .Void, .Undefined, .Null => return null,
+        .int, .float, .bool, .void, .undefined, .null => return null,
 
         else => return .{ .problem = T, .fields = prev ++ &[1][]const u8{name}, .info = switch (@typeInfo(T)) {
-            .Pointer => "Pointers cannot be serialized. Consider using custom serialize/deserialize methods",
+            .pointer => "Pointers cannot be serialized. Consider using custom serialize/deserialize methods",
             .ErrorUnion => "Error unions cannot be serialized, did you mean to use a 'try' statement?",
             .ErrorSet => "Error sets cannot be serialized",
             .Fn => "Functions cannot be serialized",
@@ -317,13 +317,13 @@ pub inline fn canSerialize(comptime T: type) bool {
 /// Whether an allocator is required for deserializtion of type `T`
 pub inline fn deserializeNeedsAllocator(comptime T: type) bool {
     return if (!canSerialize(T)) false else switch (@typeInfo(T)) {
-        .Struct => |info| blk: {
+        .@"struct" => |info| blk: {
             inline for (info.fields) |field| {
                 if (deserializeNeedsAllocator(field.type)) break :blk true;
             }
             break :blk false;
         },
-        .Union => |info| blk: {
+        .@"union" => |info| blk: {
             if (info.tag_type) |Tag| {
                 if (deserializeNeedsAllocator(Tag)) break :blk true;
             }
@@ -338,10 +338,10 @@ pub inline fn deserializeNeedsAllocator(comptime T: type) bool {
 
 inline fn integerLayout(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .Int, .Float => true,
-        .Vector => |info| integerLayout(info.child),
-        .Struct => |info| info.layout == .@"packed",
-        .Union => |info| info.layout == .@"packed",
+        .int, .float => true,
+        .vector => |info| integerLayout(info.child),
+        .@"struct" => |info| info.layout == .@"packed",
+        .@"union" => |info| info.layout == .@"packed",
         else => false,
     };
 }
@@ -351,12 +351,12 @@ inline fn byteLayout(comptime T: type, comptime endian: std.builtin.Endian, comp
     const is_native = endian == native_endian;
     const is_integral = integerLayout(T);
     const matches_packing = switch (packing) {
-        .bit => @typeInfo(T) == .Vector and @divFloor(@bitSizeOf(T), 8) == @sizeOf(T),
+        .bit => @typeInfo(T) == .vector and @divFloor(@bitSizeOf(T), 8) == @sizeOf(T),
         .byte => @divFloor(@bitSizeOf(T), 8) == @sizeOf(T),
     };
     if (is_native and matches_packing and is_integral) return true;
     return switch (@typeInfo(T)) {
-        .Array => |info| blk: {
+        .array => |info| blk: {
             const child_integral = integerLayout(info.child);
             const child_byte = byteLayout(info.child, endian, packing);
             if (@bitSizeOf(info.child) == 8 and (child_byte or child_integral)) break :blk true;
@@ -420,7 +420,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
         }
 
         fn deserializeEnum(self: *Self, comptime Enum: type) !Enum {
-            if (@typeInfo(Enum) != .Enum)
+            if (@typeInfo(Enum) != .@"enum")
                 @compileError("Cannot use deserializeEnum on type " ++ @typeName(Enum) ++ ", which is not an enum");
 
             return switch (packing) {
@@ -435,10 +435,10 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             if (usesNonIntSerialize(T)) return .value;
             if (byteSerializable(T, endian, packing)) return .pointer;
             return switch (@typeInfo(T)) {
-                .Null, .Void, .Undefined => .value,
-                .Bool => .value,
-                .Enum => |en| fasterDeserializeType(en.tag_type),
-                .Optional => .value,
+                .null, .void, .undefined => .value,
+                .bool => .value,
+                .@"enum" => |en| fasterDeserializeType(en.tag_type),
+                .optional => .value,
                 else => if (@sizeOf(T) <= @sizeOf(usize)) .value else .pointer,
             };
         }
@@ -472,7 +472,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 .none, .ignore_custom => {},
                 .unserializable => comptime unreachable,
                 .packed_union => return @bitCast(try self.deserializeInt(@Type(.{
-                    .Int = .{
+                    .int = .{
                         .signedness = .unsigned,
                         .bits = @bitSizeOf(T),
                     },
@@ -483,8 +483,8 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             if (byteSerializable(T, endian, packing)) raw_read: {
                 const reader = switch (packing) {
                     .bit => blk: {
-                        if (self.reader.bit_count != 0) break :raw_read;
-                        break :blk self.reader.reader();
+                        if (self.reader.count != 0) break :raw_read;
+                        break :blk self.reader.reader;
                     },
                     .byte => self.reader,
                 };
@@ -497,22 +497,22 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             }
 
             if (intSerializable(T)) {
-                const U = @Type(.{ .Int = .{
+                const U = @Type(.{ .int = .{
                     .signedness = .unsigned,
                     .bits = @bitSizeOf(T),
                 } });
                 return @bitCast(try self.deserializeInt(U));
             } else return switch (@typeInfo(T)) {
-                .Undefined => @as(@TypeOf(undefined), undefined),
-                .Void => void{},
-                .Null => null,
+                .undefined => @as(@TypeOf(undefined), undefined),
+                .void => void{},
+                .null => null,
 
-                .Float, .Int => comptime unreachable, // already handled with deserializeInt
-                .Bool => (try self.deserializeInt(u1)) != 0,
+                .float, .int => comptime unreachable, // already handled with deserializeInt
+                .bool => (try self.deserializeInt(u1)) != 0,
 
-                .Enum => self.deserializeEnum(T),
+                .@"enum" => self.deserializeEnum(T),
 
-                .Optional => |info| blk: {
+                .optional => |info| blk: {
                     const whether: bool = try self.deserializeInt(u1) == 1;
                     if (whether) {
                         break :blk try self.allocatingDeserialize(info.child, allocator);
@@ -521,10 +521,10 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                     }
                 },
 
-                .Union => |info| blk: {
+                .@"union" => |info| blk: {
                     const Tag: type = info.tag_type.?;
                     const tag: Tag = try self.deserialize(Tag);
-                    if (@typeInfo(Tag).Enum.is_exhaustive) {
+                    if (@typeInfo(Tag).@"enum".is_exhaustive) {
                         switch (tag) {
                             inline else => |field| {
                                 const Payload: type = @TypeOf(@field(@as(T, undefined), @tagName(field)));
@@ -598,9 +598,9 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             const ptr_info = @typeInfo(@TypeOf(ptr));
 
             const T: type = switch (ptr_info) {
-                .Pointer => |p| blk: {
+                .pointer => |p| blk: {
                     switch (p.size) {
-                        .One, .C => {},
+                        .one, .c => {},
                         else => @compileError("A multi item pointer has been passed into deserializeInto"),
                     }
                     if (p.is_const)
@@ -635,7 +635,7 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                 .unserializable => comptime unreachable,
                 .packed_union => {
                     ptr.* = @bitCast(try self.deserializeInt(@Type(.{
-                        .Int = .{
+                        .int = .{
                             .signedness = .unsigned,
                             .bits = @bitSizeOf(T),
                         },
@@ -648,8 +648,8 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             if (byteSerializable(T, endian, packing)) raw_read: {
                 const reader = switch (packing) {
                     .bit => blk: {
-                        if (self.reader.bit_count != 0) break :raw_read;
-                        break :blk self.reader.reader();
+                        if (self.reader.count != 0) break :raw_read;
+                        break :blk self.reader.reader;
                     },
                     .byte => self.reader,
                 };
@@ -662,18 +662,18 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
             }
 
             switch (@typeInfo(T)) {
-                .Float, .Int => ptr.* = try self.deserializeInt(T), // handled with the intSerializable check
-                .Void, .Undefined, .Null, .Enum, .Bool, .Optional => ptr.* = try self.deserialize(T),
-                .Struct => |info| inline for (info.fields) |field_info| {
+                .float, .int => ptr.* = try self.deserializeInt(T), // handled with the intSerializable check
+                .void, .undefined, .null, .@"enum", .bool, .optional => ptr.* = try self.deserialize(T),
+                .@"struct" => |info| inline for (info.fields) |field_info| {
                     switch (fasterDeserializeType(@TypeOf(@field(ptr, field_info.name)))) {
                         .pointer => try self.allocatingDeserializeInto(&@field(ptr, field_info.name), allocator),
                         .value => @field(ptr, field_info.name) = try self.allocatingDeserialize(@TypeOf(@field(ptr, field_info.name)), allocator),
                     }
                 },
-                .Union => |info| {
+                .@"union" => |info| {
                     const Tag: type = info.tag_type.?;
                     const tag: Tag = try self.deserialize(Tag);
-                    if (@typeInfo(Tag).Enum.is_exhaustive) {
+                    if (@typeInfo(Tag).@"enum".is_exhaustive) {
                         switch (tag) {
                             inline else => |field| {
                                 switch (fasterDeserializeType(@TypeOf(@field(ptr, @tagName(field))))) {
@@ -706,12 +706,12 @@ pub fn Deserializer(comptime endianness: std.builtin.Endian, comptime packing_mo
                         return error.Corrupt;
                     }
                 },
-                .Array => {
+                .array => {
                     for (ptr) |*item| {
                         try self.allocatingDeserializeInto(item, allocator);
                     }
                 },
-                .Vector => |info| {
+                .vector => |info| {
                     for (0..info.len) |i| {
                         if (fasterDeserializeType(info.child) == .pointer and @typeInfo(@TypeOf(&ptr[i])).Pointer.alignment >= @alignOf(info.child)) {
                             try self.allocatingDeserializeInto(&ptr[i], allocator);
@@ -807,7 +807,7 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
         }
 
         fn serializeEnum(self: *Self, comptime Enum: type, tag: Enum) !void {
-            if (@typeInfo(Enum) != .Enum)
+            if (@typeInfo(Enum) != .@"enum")
                 @compileError("Cannot use serializeEnum on type " ++ @typeName(Enum) ++ ", which is not an enum");
 
             return switch (packing) {
@@ -827,7 +827,7 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
                 .none, .ignore_custom => {},
                 .unserializable => comptime unreachable,
                 .packed_union => return self.serializeInt(@Type(.{
-                    .Int = .{
+                    .int = .{
                         .signedness = .unsigned,
                         .bits = @bitSizeOf(T),
                     },
@@ -837,24 +837,24 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
             if (byteSerializable(T, endian, packing)) raw_write: {
                 const writer = switch (packing) {
                     .bit => blk: {
-                        if (self.writer.bit_count != 0) break :raw_write;
-                        break :blk self.writer.writer();
+                        if (self.writer.count != 0) break :raw_write;
+                        break :blk self.writer.writer;
                     },
                     .byte => self.writer,
                 };
                 return writer.writeAll(std.mem.asBytes(&value));
             }
             if (intSerializable(T)) {
-                const U = @Type(.{ .Int = .{
+                const U = @Type(.{ .int = .{
                     .signedness = .unsigned,
                     .bits = @bitSizeOf(T),
                 } });
                 return self.serializeInt(U, @bitCast(value));
             } else switch (@typeInfo(T)) {
-                .Void, .Undefined, .Null => return void{},
-                .Bool => try self.serializeInt(u1, @intFromBool(value)),
-                .Float, .Int => comptime unreachable, // handled by intSerializable
-                .Struct => |info| {
+                .void, .undefined, .null => return void{},
+                .bool => try self.serializeInt(u1, @intFromBool(value)),
+                .float, .int => comptime unreachable, // handled by intSerializable
+                .@"struct" => |info| {
                     if (intSerializable(T)) {
                         try self.serializeInt(T, value);
                     } else inline for (info.fields) |field_info| {
@@ -863,9 +863,9 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
                         try self.serialize(FieldType, @field(value, name));
                     }
                 },
-                .Union => |info| union_blk: {
+                .@"union" => |info| union_blk: {
                     const TagType = info.tag_type.?;
-                    if (!@typeInfo(TagType).Enum.is_exhaustive) {
+                    if (!@typeInfo(TagType).@"enum".is_exhaustive) {
                         try self.serialize(TagType, value);
                         inline for (info.fields) |field| {
                             const field_enum: TagType = @field(TagType, field.name);
@@ -884,18 +884,18 @@ pub fn Serializer(comptime endianness: std.builtin.Endian, comptime packing_mode
                         },
                     }
                 },
-                .Optional => |op| {
+                .optional => |op| {
                     const is_some: bool = value != null;
                     try self.serializeInt(u1, @intFromBool(is_some));
                     if (is_some) try self.serialize(op.child, value.?);
                 },
-                .Enum => try self.serializeEnum(T, value),
-                .Array => |info| {
+                .@"enum" => try self.serializeEnum(T, value),
+                .array => |info| {
                     for (value) |item| {
                         try self.serialize(info.child, item);
                     }
                 },
-                .Vector => |info| {
+                .vector => |info| {
                     for (0..info.len) |i| {
                         try self.serialize(info.child, value[i]);
                     }
@@ -1046,11 +1046,11 @@ fn testIntSerializerDeserializer(comptime endian: std.builtin.Endian, comptime p
 
     comptime var i: comptime_int = 0;
     inline while (i <= max_test_bitsize) : (i += 1) {
-        const U: type = @Type(.{ .Int = .{
+        const U: type = @Type(.{ .int = .{
             .signedness = .unsigned,
             .bits = i,
         } });
-        const S: type = @Type(.{ .Int = .{
+        const S: type = @Type(.{ .int = .{
             .signedness = .signed,
             .bits = i,
         } });
@@ -1061,11 +1061,11 @@ fn testIntSerializerDeserializer(comptime endian: std.builtin.Endian, comptime p
 
     i = 0;
     inline while (i <= max_test_bitsize) : (i += 1) {
-        const U: type = @Type(.{ .Int = .{
+        const U: type = @Type(.{ .int = .{
             .signedness = .unsigned,
             .bits = i,
         } });
-        const S: type = @Type(.{ .Int = .{
+        const S: type = @Type(.{ .int = .{
             .signedness = .signed,
             .bits = i,
         } });
