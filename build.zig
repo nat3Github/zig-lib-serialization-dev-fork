@@ -30,23 +30,25 @@ pub fn build(b: *std.Build) void {
     });
 
     const tests = b.addTest(.{
-        .name = "Serialization-Tests",
+        .name = "serialization-tests",
         .root_module = module,
     });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
 
     const doc_compile = b.addTest(.{
-        .name = "Serialization",
+        .name = "serialization-docs",
         .root_module = module,
     });
     doc_compile.step.dependOn(fmt_step);
 
     const docs = doc_compile.getEmittedDocs();
+    b.addNamedLazyPath("docs", docs);
+
     const doc_install = b.addInstallDirectory(.{
         .install_dir = .{ .custom = "doc" },
         .source_dir = docs,
-        .install_subdir = "",
+        .install_subdir = &.{},
     });
 
     doc_step.dependOn(&doc_install.step);
