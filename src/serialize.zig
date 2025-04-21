@@ -1116,6 +1116,47 @@ test "serialize nested const slices" {
     try testSerializable(MyDataType, mydata, arena.allocator(), testing.expectEqualDeep);
 }
 
+fn example() !void {
+    const MyDataType2 = struct {
+        arr: []const i32,
+        hello_world: []const u8,
+    };
+    const MyDataType = struct {
+        arr: []const f64,
+        tomato: []const u8,
+        nested: []const MyDataType2,
+    };
+    const nested = MyDataType2{
+        .arr = &.{ 3, 2, 1 },
+        .hello_world = "hello world",
+    };
+
+    const mydata = MyDataType{
+        .arr = &.{ 1, 2, 3 },
+        .tomato = "tomato",
+        .nested = &.{ nested, nested },
+    };
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var list = std.ArrayList(u8).init(alloc);
+
+    var ser = serializer(.little, .bit, list.writer());
+
+    try ser.serialize(MyDataType, mydata);
+    const dat = list.items;
+
+    var fixed_stream = std.io.fixedBufferStream(dat);
+
+    var de = deserializer(.little, .bit, fixed_stream.reader());
+    const rede = try de.deserialize(MyDataType, alloc);
+    std.log.warn("print : {any}", .{rede});
+}
+test "run example" {
+    try example();
+}
+
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2015-2020 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
