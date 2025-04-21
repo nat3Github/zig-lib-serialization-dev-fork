@@ -4,6 +4,10 @@ Zig Serialization provides an easy to use interface to portably serialize and de
 
 This library is based on the now-removed `io.serialization` API from the zig standard library. You can find the original code [here](https://github.com/ziglang/std-lib-orphanage/blob/master/std/serialization.zig) in the [ziglang/std-lib-orphanage](https://github.com/ziglang/std-lib-orphanage) repository.
 
+# Limitations:
+
+- all pointer types beside slices are currently unsupported
+
 ## How to use in your project
 
 ### Adding dependency to your build script
